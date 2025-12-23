@@ -5,17 +5,13 @@ set -euo pipefail
 HUB_NAME="${HUB_NAME:-VPN}"
 VPN_USER="${VPN_USER:-vpn}"
 VPN_PASS="${VPN_PASS:-vpn}"
-ADMIN_PASS="${ADMIN_PASS:-qwe895388}"
+ADMIN_PASS="${ADMIN_PASS:-strongpassword}"
 LISTEN_PORT="${LISTEN_PORT:-443}"
-# что писать в remote в ovpn (лучше домен или публичный IP)
-REMOTE_HOST="${REMOTE_HOST:-}"
 
-# ====== ДЕПСЫ ======
+REMOTE_HOST="${REMOTE_HOST:-}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y git build-essential libreadline-dev libssl-dev zlib1g-dev unzip
-
-# ====== СБОРКА/УСТАНОВКА SoftEther ======
 SRC_DIR="/usr/local/src/SoftEtherVPN_Stable"
 if [[ ! -d "$SRC_DIR" ]]; then
   git clone --depth 1 https://github.com/SoftEtherVPN/SoftEtherVPN_Stable.git "$SRC_DIR"
@@ -23,8 +19,6 @@ fi
 
 cd "$SRC_DIR"
 ./configure
-
-# сборка иногда просит подтвердить лицензию цифрой. "yes 1" это закрывает.
 yes 1 | make -j"$(nproc)"
 
 install -d /usr/local/vpnserver/vpnserver /usr/local/vpnserver/vpncmd
@@ -32,8 +26,6 @@ cp -a ./bin/vpnserver/* /usr/local/vpnserver/vpnserver/
 cp -a ./bin/vpncmd/* /usr/local/vpnserver/vpncmd/
 
 chmod 700 /usr/local/vpnserver/vpnserver/vpnserver /usr/local/vpnserver/vpncmd/vpncmd
-
-# ====== systemd ======
 cat >/etc/systemd/system/vpnserver.service <<'EOF'
 [Unit]
 Description=SoftEther VPN Server
@@ -55,24 +47,15 @@ systemctl enable --now vpnserver
 
 VPNCMD="/usr/local/vpnserver/vpncmd/vpncmd"
 
-# ====== НАСТРОЙКА SoftEther ======
-# пароль администратора сервера
 $VPNCMD localhost /SERVER /CMD ServerPasswordSet "$ADMIN_PASS" >/dev/null
-
-# создать HUB (если уже есть — не падаем)
 $VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD HubCreate "$HUB_NAME" /PASSWORD:"" >/dev/null || true
-
-# создать пользователя + пароль
 $VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD UserCreate "$VPN_USER" /GROUP:none /REALNAME:none /NOTE:none >/dev/null || true
 $VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD UserPasswordSet "$VPN_USER" /PASSWORD:"$VPN_PASS" >/dev/null
 
-# включить SecureNAT (чтобы был “просто интернет”)
 $VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD SecureNatEnable >/dev/null || true
 
-# включить OpenVPN Clone (UDP-порты включатся, но мы будем юзать TCP 443)
 $VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD OpenVpnEnable yes /PORTS:1194 >/dev/null || true
 
-# ====== СГЕНЕРИТЬ OVPN ZIP ======
 WORKDIR="/root/softether-client"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -96,12 +79,12 @@ if [[ -z "$OVPN" ]]; then
   exit 1
 fi
 
-# REMOTE_HOST: если не задан, оставим как есть (потом руками поправишь)
+
 if [[ -n "$REMOTE_HOST" ]]; then
   sed -i -E "s/^remote[[:space:]].*/remote ${REMOTE_HOST} ${LISTEN_PORT}/" "$OVPN"
 fi
 
-# ПАТЧ под TCP 443 (самое важное)
+# ПАТЧ под TCP 443 
 sed -i -E 's/^proto[[:space:]].*/proto tcp-client/' "$OVPN"
 sed -i -E '/^explicit-exit-notify/d' "$OVPN"
 
