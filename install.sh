@@ -393,7 +393,7 @@ do_install_flow(){
     host="$(prompt "IP/DNS сервера (Enter = авто)" "$detected")"
     [[ -n "$host" ]] || die "Нужен IP/DNS."
     port="$(prompt "Порт" "$port")"
-    admin="$(prompt_secret "Пароль администратора SoftEther (запомню)")"
+    admin="$(prompt_secret "Пароль администратора")"
     [[ -n "$admin" ]] || die "Пустой admin пароль не нужен."
     hub="$(prompt "Имя HUB" "$hub")"
     user="$(prompt "Логин пользователя" "vpn")"
