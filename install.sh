@@ -14,11 +14,11 @@ VPNSERVER_WORKDIR="${INSTALL_DIR}/vpnserver"
 
 UNIT="/etc/systemd/system/vpnserver.service"
 
-STATE="/root/softether-sstp.env"     # тут запоминаем host/admin/hub
+STATE="/root/softether-sstp.env"
 STATE_MODE=600
 
-PORT="443"
-DEFAULT_HUB="VPN"
+PORT_DEFAULT="443"
+HUB_DEFAULT="VPN"
 
 TTY="/dev/tty"
 
@@ -26,7 +26,6 @@ log(){ echo "[$(date +'%F %T')] $*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 need_root(){ [[ "$(id -u)" -eq 0 ]] || die "Запусти от root."; }
-
 have_tty(){ [[ -r "$TTY" && -w "$TTY" ]]; }
 
 prompt(){
@@ -57,40 +56,41 @@ pause(){
   IFS= read -r _ <"$TTY" || true
 }
 
-detect_public_ip(){
-  # best-effort, без гарантии, но обычно работает
-  local ip=""
-  ip="$(curl -4fsS https://api.ipify.org 2>/dev/null || true)"
-  [[ -z "$ip" ]] && ip="$(curl -4fsS https://ifconfig.me 2>/dev/null || true)"
-  [[ -z "$ip" ]] && ip="$(curl -4fsS https://ipinfo.io/ip 2>/dev/null || true)"
-  if [[ -z "$ip" ]]; then
-    # fallback: первый IPv4 на машине
-    ip="$(ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
-  fi
-  echo "$ip"
-}
-
-save_state(){
-  local host="$1" admin="$2" hub="$3"
-  cat >"$STATE" <<EOF
-HOST="$host"
-ADMIN_PASS="$admin"
-HUB="$hub"
-PORT="$PORT"
-EOF
-  chmod "$STATE_MODE" "$STATE"
+is_installed(){
+  [[ -x "$VPNCMD" && -x "$VPNSERVER_BIN" ]]
 }
 
 load_state(){
   [[ -f "$STATE" ]] || return 1
   # shellcheck disable=SC1090
   source "$STATE"
-  [[ -n "${HOST:-}" && -n "${ADMIN_PASS:-}" && -n "${HUB:-}" ]] || return 1
+  [[ -n "${HOST:-}" && -n "${ADMIN_PASS:-}" && -n "${HUB:-}" && -n "${PORT:-}" ]] || return 1
   return 0
 }
 
-is_installed(){
-  [[ -x "$VPNCMD" && -x "$VPNSERVER_BIN" ]]
+save_state(){
+  local host="$1" admin="$2" hub="$3" port="$4"
+  cat >"$STATE" <<EOF
+HOST="$host"
+ADMIN_PASS="$admin"
+HUB="$hub"
+PORT="$port"
+EOF
+  chmod "$STATE_MODE" "$STATE"
+}
+
+detect_public_ip(){
+  local ip=""
+  ip="$(curl -4fsS https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -4fsS https://ifconfig.me 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -4fsS https://ipinfo.io/ip 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
+  echo "$ip"
+}
+
+port_owner(){
+  local port="$1"
+  ss -lntp "sport = :$port" 2>/dev/null | tail -n +2 | sed -n '1p' || true
 }
 
 apt_install(){
@@ -111,11 +111,10 @@ install_softether(){
   ./configure
   make -j"$(nproc)"
 
-  log "Устанавливаю в $INSTALL_DIR (без rsync, да, представляешь)..."
+  log "Устанавливаю в $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR/vpnserver" "$INSTALL_DIR/vpncmd"
   cp -a "$SRC_DIR/bin/vpnserver/." "$INSTALL_DIR/vpnserver/"
   cp -a "$SRC_DIR/bin/vpncmd/."    "$INSTALL_DIR/vpncmd/"
-
   chmod 700 "$INSTALL_DIR/vpnserver/vpnserver" "$INSTALL_DIR/vpncmd/vpncmd"
 }
 
@@ -142,52 +141,90 @@ EOF
   systemctl enable --now vpnserver
 }
 
+# ---- vpncmd wrappers (важно: подаём "y", чтобы не зависало на подтверждениях) ----
+vpncmd_raw(){
+  # $1 = stdin text (может быть пустым)
+  local stdin_text="${1:-}"; shift
+  if [[ -n "$stdin_text" ]]; then
+    printf "%b" "$stdin_text" | "$VPNCMD" "$@"
+  else
+    "$VPNCMD" "$@"
+  fi
+}
+
+vpncmd_try(){
+  # returns 0 if command works (no hang, no fatal)
+  local stdin_text="${1:-}"; shift
+  vpncmd_raw "$stdin_text" "$@" >/dev/null 2>&1
+}
+
 vpncmd_blank_admin(){
-  # на свежей установке пароль админа пустой, подаём пустую строку в prompt Password:
-  local cmd=("$@")
-  printf "\n" | "$VPNCMD" localhost /SERVER /CMD "${cmd[@]}" >/dev/null
+  # admin password is empty (fresh install). Send newline for "Password:" prompt + y just in case.
+  vpncmd_raw "\n" localhost /SERVER /CMD "$@" >/dev/null
 }
 
 vpncmd_admin(){
   local admin="$1"; shift
-  local cmd=("$@")
-  "$VPNCMD" localhost /SERVER /PASSWORD:"$admin" /CMD "${cmd[@]}" >/dev/null
+  # send "y\n" just in case some command asks confirmation
+  vpncmd_raw "y\n" localhost /SERVER /PASSWORD:"$admin" /CMD "$@" >/dev/null
 }
 
 vpncmd_hub(){
   local admin="$1" hub="$2"; shift 2
-  local cmd=("$@")
-  "$VPNCMD" localhost /SERVER /PASSWORD:"$admin" /HUB:"$hub" /CMD "${cmd[@]}" >/dev/null
+  vpncmd_raw "y\n" localhost /SERVER /PASSWORD:"$admin" /HUB:"$hub" /CMD "$@" >/dev/null
+}
+
+ensure_admin_password(){
+  local admin="$1"
+  # Case A: fresh install, blank password
+  if vpncmd_try "\n" localhost /SERVER /CMD ServerInfoGet; then
+    vpncmd_blank_admin ServerPasswordSet "$admin"
+    return 0
+  fi
+  # Case B: password already set, try provided one
+  if vpncmd_try "" localhost /SERVER /PASSWORD:"$admin" /CMD ServerInfoGet; then
+    return 0
+  fi
+  die "Не могу авторизоваться в vpncmd. Пароль администратора неверный или сервер не доступен."
 }
 
 configure_server(){
-  local host="$1" admin="$2" hub="$3"
+  local host="$1" admin="$2" hub="$3" port="$4"
 
-  log "Ставлю пароль администратора SoftEther (если уже стоит, просто переживём)..."
-  vpncmd_blank_admin ServerPasswordSet "$admin" || true
+  log "Ставлю/проверяю пароль администратора SoftEther..."
+  ensure_admin_password "$admin"
 
-  log "Оставляю слушатель только на TCP/$PORT (лишнее прибиваю)..."
-  vpncmd_admin "$admin" ListenerCreate "$PORT" || true
-  vpncmd_admin "$admin" ListenerEnable "$PORT" || true
-  vpncmd_admin "$admin" ListenerDelete 992  || true
-  vpncmd_admin "$admin" ListenerDelete 5555 || true
-  vpncmd_admin "$admin" ListenerDelete 1194 || true
+  log "Проверяю порт $port..."
+  local owner
+  owner="$(port_owner "$port")"
+  if [[ -n "$owner" && "$owner" != *vpnserver* ]]; then
+    die "Порт $port занят: $owner. Освободи порт или выбери другой."
+  fi
 
-  log "Перегенерирую серверный SSL сертификат под CN=$host (чтобы Windows меньше ныл)..."
+  log "Настраиваю слушатель $port (disable лишнее, enable нужное)..."
+  # Не удаляем listener'ы (там могут быть подтверждения/подвисы), просто выключаем.
+  vpncmd_admin "$admin" ListenerCreate "$port" || true
+  vpncmd_admin "$admin" ListenerEnable "$port" || true
+
+  # попытка отключить стандартные порты (если есть) без боли
+  vpncmd_admin "$admin" ListenerDisable 992  || true
+  vpncmd_admin "$admin" ListenerDisable 5555 || true
+  vpncmd_admin "$admin" ListenerDisable 1194 || true
+
+  log "Перегенерирую серверный SSL сертификат под CN=$host ..."
   vpncmd_admin "$admin" ServerCertRegenerate "$host" || true
 
   log "Создаю HUB $hub (если уже есть, ок)..."
-  # HUB пароль не спрашиваем вообще, он не нужен для твоего сценария "просто интернет"
   vpncmd_admin "$admin" HubCreate "$hub" /PASSWORD:"$admin" || true
 
-  log "Включаю SecureNAT на HUB (выход в интернет)..."
+  log "Включаю SecureNAT (выход в интернет)..."
   vpncmd_hub "$admin" "$hub" SecureNatEnable || true
 
   log "Включаю SSTP..."
   vpncmd_admin "$admin" SstpEnable yes || true
 
   systemctl restart vpnserver
-  systemctl is-active --quiet vpnserver || die "vpnserver не запустился. Смотри: journalctl -u vpnserver -n 200 --no-pager"
+  systemctl is-active --quiet vpnserver || die "vpnserver не запустился. journalctl -u vpnserver -n 200 --no-pager"
 }
 
 create_user(){
@@ -203,17 +240,18 @@ delete_user(){
   vpncmd_hub "$admin" "$hub" UserDelete "$user" || true
 }
 
-export_server_cert(){
-  local host="$1" pem="$2" der="$3"
-  log "Снимаю сертификат с $host:$PORT ..."
-  openssl s_client -connect "${host}:${PORT}" -servername "$host" -showcerts </dev/null 2>/dev/null \
+export_server_cert_local(){
+  # Берём сертификат с localhost, чтобы не зависеть от внешней сети/маршрутизации.
+  local sni="$1" port="$2" pem="$3" der="$4"
+  log "Снимаю сертификат с 127.0.0.1:$port (SNI=$sni)..."
+  openssl s_client -connect "127.0.0.1:${port}" -servername "$sni" -showcerts </dev/null 2>/dev/null \
     | awk 'BEGIN{c=0} /BEGIN CERTIFICATE/{c++} c==1{print} /END CERTIFICATE/{if(c==1) exit}' \
     >"$pem"
   openssl x509 -in "$pem" -outform DER -out "$der"
 }
 
 gen_clients(){
-  local host="$1" hub="$2" user="$3" pass="$4"
+  local host="$1" hub="$2" user="$3" pass="$4" port="$5"
 
   local out_dir="/root/${user}_clients"
   local zip_path="/root/${host}_${user}_clients.zip"
@@ -221,7 +259,7 @@ gen_clients(){
   mkdir -p "$out_dir"
   chmod 700 "$out_dir"
 
-  export_server_cert "$host" "$out_dir/server-cert.pem" "$out_dir/server.cer"
+  export_server_cert_local "$host" "$port" "$out_dir/server-cert.pem" "$out_dir/server.cer"
 
   local vpn_name="SSTP-${host}"
 
@@ -230,7 +268,6 @@ gen_clients(){
 \$ErrorActionPreference = "Stop"
 
 \$Server = "$host"
-\$Hub    = "$hub"
 \$User   = "${user}@${hub}"
 \$Pass   = "$pass"
 \$Name   = "$vpn_name"
@@ -272,7 +309,7 @@ PASS="$pass"
 sudo apt-get update -y
 sudo apt-get install -y sstp-client ppp
 
-# безопасность пофиг, как просили:
+# безопасность "как попросили":
 sudo sstpc --cert-warn --tls-ext --user "\$USER" --password "\$PASS" "\$SERVER" usepeerdns require-mschap-v2 noauth noccp defaultroute &
 echo "OK. Отключение: ./linux_disconnect.sh"
 EOF
@@ -287,23 +324,19 @@ EOF
   chmod +x "$out_dir/linux_disconnect.sh"
 
   cat >"$out_dir/README.txt" <<EOF
-Сервер: $host:$PORT
+Сервер: $host:$port
 HUB:    $hub
 Логин:  ${user}@${hub}
 
-Windows:
-- скопируй папку ${user}_clients на ПК
-- запусти windows_run_as_admin.bat от имени администратора
-
-Linux (Debian/Ubuntu):
-- ./linux_connect.sh
-- отключить: ./linux_disconnect.sh
+Готовые файлы подключения:
+- Windows: windows_run_as_admin.bat (запуск от администратора)
+- Linux:   linux_connect.sh
 
 Android:
 - любой SSTP-клиент
   Server: $host
   User:   ${user}@${hub}
-  Pass:   (как выдал скрипт)
+  Pass:   (как задано)
 EOF
 
   (cd /root && zip -r -9 "$(basename "$zip_path")" "$(basename "$out_dir")" >/dev/null)
@@ -333,69 +366,104 @@ purge_all(){
   log "Готово. Всё удалено."
 }
 
+usage(){
+  cat <<EOF
+$APP
+
+Интерактивно:
+  curl -fsSL https://raw.githubusercontent.com/igruli0807/sstp-vpn/main/install.sh | bash
+
+Быстрый режим:
+  bash install.sh --install --host X.X.X.X --adminpass ADMIN --hub VPN --user vpn --pass PASS [--port 443]
+  bash install.sh --add-user --user NAME --pass PASS
+  bash install.sh --del-user --user NAME
+  bash install.sh --purge
+EOF
+}
+
+# ---- flows ----
 do_install_flow(){
-  local detected host admin hub user pass
+  local host admin hub user pass port detected
 
   detected="$(detect_public_ip)"
-  [[ -n "$detected" ]] || detected="(не смог определить)"
-  host="$(prompt "IP/DNS сервера (Enter = авто)" "${detected}")"
-  [[ -n "$host" && "$host" != "(не смог определить)" ]] || die "Нужен IP/DNS (авто-детект не сработал)."
+  port="$PORT_DEFAULT"
+  hub="$HUB_DEFAULT"
 
-  admin="$(prompt_secret "Пароль администратора SoftEther (запомню, больше не спрошу)")"
-  [[ -n "$admin" ]] || die "Пустой admin пароль не нужен даже тебе."
+  if have_tty; then
+    host="$(prompt "IP/DNS сервера (Enter = авто)" "$detected")"
+    [[ -n "$host" ]] || die "Нужен IP/DNS."
+    port="$(prompt "Порт" "$port")"
+    admin="$(prompt_secret "Пароль администратора SoftEther (запомню)")"
+    [[ -n "$admin" ]] || die "Пустой admin пароль не нужен."
+    hub="$(prompt "Имя HUB" "$hub")"
+    user="$(prompt "Логин пользователя" "vpn")"
+    pass="$(prompt_secret "Пароль пользователя")"
+    [[ -n "$pass" ]] || die "Пустой пароль пользователя."
+  else
+    die "Нет TTY. Используй параметры --install ..."
+  fi
 
-  hub="$(prompt "Имя HUB" "$DEFAULT_HUB")"
-  [[ -n "$hub" ]] || hub="$DEFAULT_HUB"
+  # если уже установлено: не пересобираем, просто продолжаем
+  if ! is_installed; then
+    apt_install
+    install_softether
+    install_unit
+  else
+    log "SoftEther уже установлен, пересборку пропускаю."
+    systemctl enable --now vpnserver || true
+  fi
 
-  user="$(prompt "Логин пользователя" "vpn")"
-  pass="$(prompt_secret "Пароль пользователя")"
-  [[ -n "$pass" ]] || die "Пустой пароль пользователя? Ну ты понял."
-
-  apt_install
-  install_softether
-  install_unit
-  configure_server "$host" "$admin" "$hub"
-  save_state "$host" "$admin" "$hub"
+  configure_server "$host" "$admin" "$hub" "$port"
+  save_state "$host" "$admin" "$hub" "$port"
   create_user "$admin" "$hub" "$user" "$pass"
-  gen_clients "$host" "$hub" "$user" "$pass"
+  gen_clients "$host" "$hub" "$user" "$pass" "$port"
 
   cat >"$TTY" <<EOF
 
 === Дальше что делать ===
-1) Забери архив с сервера:
+1) Забери архив:
    /root/${host}_${user}_clients.zip
 
 2) Windows:
-   - распакуй
-   - запусти windows_run_as_admin.bat (от админа)
+   - распакуй архив
+   - запусти windows_run_as_admin.bat (от имени администратора)
 
 3) Linux:
    - ./linux_connect.sh
+   - отключить: ./linux_disconnect.sh
 
 EOF
   pause
 }
 
 do_add_user_flow(){
-  load_state || die "Нет $STATE. Сначала пункт 1 (установка)."
-  is_installed || die "SoftEther не установлен. Сначала пункт 1."
+  load_state || die "Нет $STATE. Сначала установка (пункт 1) или --install."
+  is_installed || die "SoftEther не установлен. Сначала установка (пункт 1)."
 
   local user pass
-  user="$(prompt "Логин пользователя" "vpn")"
-  pass="$(prompt_secret "Пароль пользователя")"
-  [[ -n "$pass" ]] || die "Пустой пароль пользователя."
+  if have_tty; then
+    user="$(prompt "Логин пользователя" "vpn")"
+    pass="$(prompt_secret "Пароль пользователя")"
+  else
+    die "Нет TTY. Используй --add-user --user ... --pass ..."
+  fi
 
+  [[ -n "$pass" ]] || die "Пустой пароль пользователя."
   create_user "$ADMIN_PASS" "$HUB" "$user" "$pass"
-  gen_clients "$HOST" "$HUB" "$user" "$pass"
+  gen_clients "$HOST" "$HUB" "$user" "$pass" "$PORT"
   pause
 }
 
 do_del_user_flow(){
-  load_state || die "Нет $STATE. Сначала пункт 1 (установка)."
+  load_state || die "Нет $STATE. Сначала установка."
   is_installed || die "SoftEther не установлен."
 
   local user
-  user="$(prompt "Логин пользователя на удаление" "")"
+  if have_tty; then
+    user="$(prompt "Логин пользователя на удаление" "")"
+  else
+    die "Нет TTY. Используй --del-user --user ..."
+  fi
   [[ -n "$user" ]] || die "Нужен логин."
 
   delete_user "$ADMIN_PASS" "$HUB" "$user"
@@ -405,9 +473,80 @@ do_del_user_flow(){
   pause
 }
 
-menu(){
-  while true; do
-    cat >"$TTY" <<EOF
+# ---- CLI args ----
+MODE=""
+HOST_ARG="" ADMIN_ARG="" HUB_ARG="" USER_ARG="" PASS_ARG="" PORT_ARG="$PORT_DEFAULT"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install) MODE="install"; shift;;
+    --add-user) MODE="add"; shift;;
+    --del-user) MODE="del"; shift;;
+    --purge) MODE="purge"; shift;;
+    --host) HOST_ARG="${2:-}"; shift 2;;
+    --adminpass) ADMIN_ARG="${2:-}"; shift 2;;
+    --hub) HUB_ARG="${2:-}"; shift 2;;
+    --user) USER_ARG="${2:-}"; shift 2;;
+    --pass) PASS_ARG="${2:-}"; shift 2;;
+    --port) PORT_ARG="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) die "Неизвестный аргумент: $1";;
+  esac
+done
+
+need_root
+
+if [[ -n "$MODE" ]]; then
+  case "$MODE" in
+    purge)
+      purge_all
+      exit 0
+      ;;
+    install)
+      [[ -n "$HOST_ARG" && -n "$ADMIN_ARG" && -n "$USER_ARG" && -n "$PASS_ARG" ]] || die "Нужны --host --adminpass --user --pass (и опционально --hub --port)"
+      [[ -n "$HUB_ARG" ]] || HUB_ARG="$HUB_DEFAULT"
+      [[ -n "$PORT_ARG" ]] || PORT_ARG="$PORT_DEFAULT"
+
+      if ! is_installed; then
+        apt_install
+        install_softether
+        install_unit
+      else
+        log "SoftEther уже установлен, пересборку пропускаю."
+        systemctl enable --now vpnserver || true
+      fi
+
+      configure_server "$HOST_ARG" "$ADMIN_ARG" "$HUB_ARG" "$PORT_ARG"
+      save_state "$HOST_ARG" "$ADMIN_ARG" "$HUB_ARG" "$PORT_ARG"
+      create_user "$ADMIN_ARG" "$HUB_ARG" "$USER_ARG" "$PASS_ARG"
+      gen_clients "$HOST_ARG" "$HUB_ARG" "$USER_ARG" "$PASS_ARG" "$PORT_ARG"
+      exit 0
+      ;;
+    add)
+      load_state || die "Нет $STATE. Сначала --install."
+      is_installed || die "SoftEther не установлен."
+      [[ -n "$USER_ARG" && -n "$PASS_ARG" ]] || die "Нужны --user --pass"
+      create_user "$ADMIN_PASS" "$HUB" "$USER_ARG" "$PASS_ARG"
+      gen_clients "$HOST" "$HUB" "$USER_ARG" "$PASS_ARG" "$PORT"
+      exit 0
+      ;;
+    del)
+      load_state || die "Нет $STATE. Сначала --install."
+      is_installed || die "SoftEther не установлен."
+      [[ -n "$USER_ARG" ]] || die "Нужен --user"
+      delete_user "$ADMIN_PASS" "$HUB" "$USER_ARG"
+      rm -rf "/root/${USER_ARG}_clients" 2>/dev/null || true
+      rm -f "/root/${HOST}_${USER_ARG}_clients.zip" 2>/dev/null || true
+      exit 0
+      ;;
+  esac
+fi
+
+# ---- Interactive menu ----
+have_tty || die "Нет TTY. Для неинтерактива используй параметры (--install/--add-user/...)."
+
+while true; do
+  cat >"$TTY" <<EOF
 
 $APP
 1) Установить/настроить сервер + создать пользователя + сгенерировать клиенты
@@ -417,25 +556,18 @@ $APP
 0) Выход
 
 EOF
-    local c
-    c="$(prompt "Выбор" "")"
-    case "$c" in
-      1) do_install_flow ;;
-      2) do_add_user_flow ;;
-      3) do_del_user_flow ;;
-      4)
-        local sure
-        sure="$(prompt "Точно удалить ВСЁ? (yes/no)" "no")"
-        [[ "$sure" == "yes" ]] || { log "Отменено."; pause; continue; }
-        purge_all
-        pause
-        ;;
-      0) exit 0 ;;
-      *) log "Неверный выбор."; pause ;;
-    esac
-  done
-}
-
-need_root
-have_tty || die "Запусти в нормальном терминале (нужен /dev/tty)."
-menu
+  c="$(prompt "Выбор" "")"
+  case "$c" in
+    1) do_install_flow ;;
+    2) do_add_user_flow ;;
+    3) do_del_user_flow ;;
+    4)
+      sure="$(prompt "Точно удалить ВСЁ? (yes/no)" "no")"
+      [[ "$sure" == "yes" ]] || { log "Отменено."; pause; continue; }
+      purge_all
+      pause
+      ;;
+    0) exit 0 ;;
+    *) log "Неверный выбор."; pause ;;
+  esac
+done
