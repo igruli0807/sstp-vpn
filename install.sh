@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# SoftEther SSTP VPN (TCP/443) installer/manager for Debian/Ubuntu
-# - Interactive menu
-# - Non-interactive flags:
-#   --install --host <PUBLIC_HOST_OR_IP> --adminpass <PASS> --user <VPN_USER> --pass <VPN_PASS>
-#   --add-user --user <VPN_USER> --pass <VPN_PASS>
-#   --del-user --user <VPN_USER>
-#   --uninstall
-#
-# Creates client bundle:
-#   /root/softether-clients.zip  (Windows PowerShell + Linux bash + server.cer)
-#
-# Notes:
-# - Uses self-signed cert (server.cer) and imports it on Windows to avoid SSTP trust errors.
-# - Security intentionally minimal.
-
 SCRIPT_NAME="$(basename "$0")"
 STATE_DIR="/etc/softether-sstp-vpn"
 STATE_FILE="${STATE_DIR}/state.env"
