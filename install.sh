@@ -1,31 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ====== НАСТРОЙКИ (можно переопределять переменными окружения) ======
-HUB_NAME="${HUB_NAME:-VPN}"
-VPN_USER="${VPN_USER:-vpn}"
-VPN_PASS="${VPN_PASS:-vpn}"
-ADMIN_PASS="${ADMIN_PASS:-strongpassword}"
-LISTEN_PORT="${LISTEN_PORT:-443}"
+SE_HUB="${SE_HUB:-VPN}"
+SE_USER="${SE_USER:-vpn}"
+SE_PASS="${SE_PASS:-vpn}"
+SE_ADMIN_PASS="${SE_ADMIN_PASS:-}"
+SE_PORT="${SE_PORT:-443}"
 
-REMOTE_HOST="${REMOTE_HOST:-}"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y git build-essential libreadline-dev libssl-dev zlib1g-dev unzip
-SRC_DIR="/usr/local/src/SoftEtherVPN_Stable"
-if [[ ! -d "$SRC_DIR" ]]; then
-  git clone --depth 1 https://github.com/SoftEtherVPN/SoftEtherVPN_Stable.git "$SRC_DIR"
+
+DEF_SRC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+SE_CERT_CN="${SE_CERT_CN:-${DEF_SRC_IP}}"
+
+# Генерим админ-пароль если не задан
+if [[ -z "${SE_ADMIN_PASS}" ]]; then
+  SE_ADMIN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
 fi
 
-cd "$SRC_DIR"
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Run as root."
+  exit 1
+fi
+
+if ss -lntp | awk '{print $4}' | grep -qE "[:.]${SE_PORT}$"; then
+  echo "Port ${SE_PORT}/tcp is busy. Free it first."
+  ss -lntp | grep -E "[:.]${SE_PORT} " || true
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y git build-essential libreadline-dev libssl-dev zlib1g-dev \
+  ca-certificates openssl unzip
+
+
+cd /usr/local/src
+rm -rf SoftEtherVPN_Stable
+git clone --depth 1 https://github.com/SoftEtherVPN/SoftEtherVPN_Stable.git
+cd SoftEtherVPN_Stable
+
 ./configure
-yes 1 | make -j"$(nproc)"
+# У SoftEther в этой ветке сборка не в build/, а в корне (у тебя это уже проявилось)
+make -j"$(nproc)"
 
-install -d /usr/local/vpnserver/vpnserver /usr/local/vpnserver/vpncmd
-cp -a ./bin/vpnserver/* /usr/local/vpnserver/vpnserver/
-cp -a ./bin/vpncmd/* /usr/local/vpnserver/vpncmd/
 
+rm -rf /usr/local/vpnserver
+mkdir -p /usr/local/vpnserver
+
+
+cp -a ./bin/vpnserver /usr/local/vpnserver/
+cp -a ./bin/vpncmd /usr/local/vpnserver/
 chmod 700 /usr/local/vpnserver/vpnserver/vpnserver /usr/local/vpnserver/vpncmd/vpncmd
+
+
 cat >/etc/systemd/system/vpnserver.service <<'EOF'
 [Unit]
 Description=SoftEther VPN Server
@@ -47,55 +74,52 @@ systemctl enable --now vpnserver
 
 VPNCMD="/usr/local/vpnserver/vpncmd/vpncmd"
 
-$VPNCMD localhost /SERVER /CMD ServerPasswordSet "$ADMIN_PASS" >/dev/null
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD HubCreate "$HUB_NAME" /PASSWORD:"" >/dev/null || true
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD UserCreate "$VPN_USER" /GROUP:none /REALNAME:none /NOTE:none >/dev/null || true
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD UserPasswordSet "$VPN_USER" /PASSWORD:"$VPN_PASS" >/dev/null
+# ========== Configure SoftEther ==========
+# 1) Set server admin password (если его не было, vpncmd спросит "Password:" -> отправляем пустую строку)
+printf "\n" | "${VPNCMD}" localhost /SERVER /CMD ServerPasswordSet "${SE_ADMIN_PASS}" >/dev/null
 
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD SecureNatEnable >/dev/null || true
+# 2) Create hub if not exists
+set +e
+"${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /CMD HubCreate "${SE_HUB}" /PASSWORD:"hubpass" >/dev/null 2>&1
+set -e
 
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD OpenVpnEnable yes /PORTS:1194 >/dev/null || true
+# 3) Create user (idempotent-ish)
+set +e
+"${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /HUB:"${SE_HUB}" \
+  /CMD UserCreate "${SE_USER}" /GROUP:none /REALNAME:none /NOTE:none >/dev/null 2>&1
+set -e
 
-WORKDIR="/root/softether-client"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
-rm -f ./*.zip 2>/dev/null || true
+"${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /HUB:"${SE_HUB}" \
+  /CMD UserPasswordSet "${SE_USER}" /PASSWORD:"${SE_PASS}" >/dev/null
 
-$VPNCMD localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD OpenVpnMakeConfig >/dev/null
+# 4) Enable SecureNAT (интернет “наружу” без твоих iptables)
+"${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /HUB:"${SE_HUB}" \
+  /CMD SecureNatEnable >/dev/null
 
-ZIP="$(ls -t ./*.zip 2>/dev/null | head -n1 || true)"
-if [[ -z "$ZIP" ]]; then
-  echo "Не найден zip после OpenVpnMakeConfig. Проверь права/логи SoftEther."
-  exit 1
+# 5) Enable SSTP (TCP/443). Команда есть в vpncmd: SstpEnable yes/no 
+"${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /CMD SstpEnable yes >/dev/null
+
+# 6) Regenerate server cert with CN = IP/hostname (важно для Windows SSTP) 
+if [[ -n "${SE_CERT_CN}" ]]; then
+  "${VPNCMD}" localhost /SERVER /PASSWORD:"${SE_ADMIN_PASS}" /CMD ServerCertRegenerate "${SE_CERT_CN}" >/dev/null
 fi
 
-rm -rf "$WORKDIR/unzip"
-mkdir -p "$WORKDIR/unzip"
-unzip -o "$ZIP" -d "$WORKDIR/unzip" >/dev/null
-
-OVPN="$(find "$WORKDIR/unzip" -name "*openvpn_remote_access_l3*.ovpn" | head -n1 || true)"
-if [[ -z "$OVPN" ]]; then
-  echo "Не найден L3 ovpn в архиве. Посмотри содержимое: find $WORKDIR/unzip -name '*.ovpn'"
-  exit 1
-fi
-
-
-if [[ -n "$REMOTE_HOST" ]]; then
-  sed -i -E "s/^remote[[:space:]].*/remote ${REMOTE_HOST} ${LISTEN_PORT}/" "$OVPN"
-fi
-
-# ПАТЧ под TCP 443 
-sed -i -E 's/^proto[[:space:]].*/proto tcp-client/' "$OVPN"
-sed -i -E '/^explicit-exit-notify/d' "$OVPN"
-
-OUT_OVPN="/root/${HUB_NAME}_${VPN_USER}_tcp443.ovpn"
-cp -a "$OVPN" "$OUT_OVPN"
+# 7) Export current server cert (самоподписанный) для импорта на Windows
+CERT_OUT="/root/softether-server.crt"
+openssl s_client -connect 127.0.0.1:"${SE_PORT}" -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM > "${CERT_OUT}"
+chmod 600 "${CERT_OUT}"
 
 echo
-echo "=== ГОТОВО ==="
-echo "OVPN файл (TCP 443): $OUT_OVPN"
-echo "Логин: ${VPN_USER}@${HUB_NAME}"
-echo "Пароль: ${VPN_PASS}"
+echo "================= READY ================="
+echo "Welcome to free internet"
 echo
-echo "Если remote не тот — открой $OUT_OVPN и пропиши: remote <IP_или_домен_сервера> 443"
-
+echo "Connect (SSTP):"
+echo "  Server: ${SE_CERT_CN:-<server-ip>}"
+echo "  Port:   ${SE_PORT}"
+echo "  User:   ${SE_USER}@${SE_HUB}"
+echo "  Pass:   ${SE_PASS}"
+echo
+echo "Windows cert file (import once): ${CERT_OUT}"
+echo "Server admin password: ${SE_ADMIN_PASS}"
+echo "========================================"
