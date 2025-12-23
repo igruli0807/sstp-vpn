@@ -1,43 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ===== Paths =====
 VPNROOT="/usr/local/vpnserver"
 VPNSRV="$VPNROOT/vpnserver/vpnserver"
 VPNCMD="$VPNROOT/vpncmd/vpncmd"
 SRCDIR="/usr/local/src/SoftEtherVPN_Stable"
 UNIT="/etc/systemd/system/vpnserver.service"
 STATE="/etc/softether-sstp.env"
+CLIENT_DIR="/root/softether-clients"
 
-# ----- helpers -----
-need_root() { [ "${EUID:-0}" -eq 0 ] || { echo "Run as root"; exit 1; }; }
-tty_read() { local var="$1"; local prompt="$2"; read -r -p "$prompt" "$var" < /dev/tty; }
+# ===== Helpers =====
+need_root() { [ "${EUID:-0}" -eq 0 ] || { echo "Запусти от root"; exit 1; }; }
+
+tty_read() { local __v="$1" __p="$2"; read -r -p "$__p" "$__v" < /dev/tty; }
+
+load_state() {
+  if [ -f "$STATE" ]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+  fi
+}
+
 save_state() {
   cat >"$STATE" <<EOF
 ADMIN_PASS='${ADMIN_PASS}'
 HUB_NAME='${HUB_NAME}'
-VPN_USER='${VPN_USER}'
-VPN_PASS='${VPN_PASS}'
 PUBLIC_HOST='${PUBLIC_HOST}'
 EOF
   chmod 600 "$STATE"
 }
-load_state() { [ -f "$STATE" ] && # shellcheck disable=SC1090
-  source "$STATE" || true; }
+
+require_admin_pass() {
+  load_state
+  if [ -z "${ADMIN_PASS:-}" ]; then
+    tty_read ADMIN_PASS "Пароль админа SoftEther SERVER: "
+  fi
+  if [ -z "${HUB_NAME:-}" ]; then
+    HUB_NAME="VPN"
+  fi
+}
 
 run_vpncmd_server() {
-  # $1.. = command tokens
   "$VPNCMD" localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD "$@"
 }
+
 run_vpncmd_hub() {
   "$VPNCMD" localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB_NAME" /CMD "$@"
 }
 
-# ----- actions -----
+port_443_check() {
+  if ss -lntp | awk '{print $4,$6}' | grep -qE '(:443)\b'; then
+    echo "Порт 443 уже занят. Освободи 443 или меняй схему."
+    ss -lntp | grep ':443' || true
+    exit 1
+  fi
+}
+
+# ===== Actions =====
 install_softether() {
   need_root
-  apt-get update
-  apt-get install -y git build-essential libreadline-dev libssl-dev zlib1g-dev unzip curl ca-certificates
+  port_443_check
 
+  apt-get update
+  apt-get install -y git build-essential libreadline-dev libssl-dev zlib1g-dev \
+    ca-certificates curl unzip
+
+  # Build SoftEther if binaries missing
   if [ ! -x "$VPNSRV" ] || [ ! -x "$VPNCMD" ]; then
     rm -rf "$SRCDIR"
     git clone --depth 1 https://github.com/SoftEtherVPN/SoftEtherVPN_Stable.git "$SRCDIR"
@@ -46,8 +75,11 @@ install_softether() {
     make -j"$(nproc)"
 
     mkdir -p "$VPNROOT/vpnserver" "$VPNROOT/vpncmd"
+
+    # Copy bin trees exactly
     cp -a "$SRCDIR/bin/vpnserver/"* "$VPNROOT/vpnserver/"
     cp -a "$SRCDIR/bin/vpncmd/"* "$VPNROOT/vpncmd/"
+
     chmod 700 "$VPNROOT/vpnserver/vpnserver" "$VPNROOT/vpncmd/vpncmd" || true
     chmod 600 "$VPNROOT/vpnserver/"*.key 2>/dev/null || true
   fi
@@ -75,147 +107,169 @@ EOF
 
 initial_config() {
   need_root
-  load_state
 
-  : "${HUB_NAME:=VPN}"
+  # Ask minimal params
+  tty_read PUBLIC_HOST "PUBLIC_HOST (IP или домен для подключения SSTP): "
+  tty_read ADMIN_PASS  "Задай пароль админа SoftEther SERVER: "
+  HUB_NAME="VPN"
 
-  if [ -z "${ADMIN_PASS:-}" ]; then
-    tty_read ADMIN_PASS "Set SoftEther SERVER admin password: "
-  fi
-  if [ -z "${PUBLIC_HOST:-}" ]; then
-    tty_read PUBLIC_HOST "Public host for clients (IP or DNS name): "
-  fi
-  if [ -z "${VPN_USER:-}" ]; then
-    tty_read VPN_USER "VPN username to create: "
-  fi
-  if [ -z "${VPN_PASS:-}" ]; then
-    tty_read VPN_PASS "VPN password for user '$VPN_USER': "
-  fi
-
-  # ServerPasswordSet may prompt for old password; if empty, feed newline.
-  # Command supports passing new password as parameter. :contentReference[oaicite:2]{index=2}
+  # Set admin password (на новой установке старого нет, поэтому пускаем пустую строку в stdin)
   echo | "$VPNCMD" localhost /SERVER /CMD ServerPasswordSet "$ADMIN_PASS" >/dev/null
 
-  # make sure hub exists
+  # Create Hub if not exists
   run_vpncmd_server HubCreate "$HUB_NAME" /PASSWORD:"hubpass" >/dev/null 2>&1 || true
 
-  # create/update user
-  run_vpncmd_hub UserCreate "$VPN_USER" /GROUP:none /REALNAME:none /NOTE:none >/dev/null 2>&1 || true
-  run_vpncmd_hub UserPasswordSet "$VPN_USER" /PASSWORD:"$VPN_PASS" >/dev/null
-
-  # enable SecureNAT (gives "just internet" NAT)
-  run_vpncmd_hub SecureNatEnable >/dev/null
+  # Enable SecureNAT (только интернет)
+  run_vpncmd_hub SecureNatEnable >/dev/null 2>&1 || true
 
   # Enable SSTP
-  # SSTP uses TCP 443 and needs valid cert for strict clients. :contentReference[oaicite:3]{index=3}
-  run_vpncmd_server SstpEnable yes >/dev/null
+  run_vpncmd_server SstpEnable yes >/dev/null 2>&1 || true
 
-  # Keep only 443 listener (optional hardening/cleanliness)
+  # Ensure listener 443 exists and enabled; remove other listeners (чтобы не торчало лишнее)
   run_vpncmd_server ListenerCreate 443 >/dev/null 2>&1 || true
   run_vpncmd_server ListenerEnable 443 >/dev/null 2>&1 || true
   for p in 5555 992 1194; do
     run_vpncmd_server ListenerDelete "$p" >/dev/null 2>&1 || true
   done
 
-  # regenerate self-signed cert with CN = PUBLIC_HOST (so Windows SSTP won't choke on CN mismatch)
-  # ServerCertRegenerate exists in vpncmd manual. :contentReference[oaicite:4]{index=4}
+  # Regenerate server certificate with CN=PUBLIC_HOST (чтобы Windows SSTP не ругался на несоответствие имени)
   run_vpncmd_server ServerCertRegenerate /CN:"$PUBLIC_HOST" /O:none /OU:none /C:none /ST:none /L:none >/dev/null 2>&1 || true
 
   save_state
-  echo "OK: server configured (Hub=$HUB_NAME, User=$VPN_USER)"
+
+  # Create first user (asked in install flow)
+  add_user
+
+  # Generate client scripts bundle
+  generate_clients
 }
 
-export_clients() {
+add_user() {
+  need_root
+  require_admin_pass
+  load_state
+
+  local u p
+  tty_read u "Логин нового пользователя: "
+  tty_read p "Пароль для '$u': "
+
+  run_vpncmd_hub UserCreate "$u" /GROUP:none /REALNAME:none /NOTE:none >/dev/null 2>&1 || true
+  run_vpncmd_hub UserPasswordSet "$u" /PASSWORD:"$p" >/dev/null
+
+  echo "Пользователь создан/обновлён: $u"
+
+  # Optional: update client scripts for this user (быстро и удобно)
+  VPN_USER="$u"
+  VPN_PASS="$p"
+  generate_clients
+}
+
+del_user() {
+  need_root
+  require_admin_pass
+  local u
+  tty_read u "Логин пользователя на удаление: "
+  run_vpncmd_hub UserDelete "$u" >/dev/null
+  echo "Пользователь удалён: $u"
+}
+
+generate_clients() {
   need_root
   load_state
-  mkdir -p /root/softether-clients
 
-  # Export server cert (X.509) for Windows trust store. :contentReference[oaicite:5]{index=5}
-  run_vpncmd_server ServerCertGet /root/softether-clients/server.cer >/dev/null
+  # Need last created user creds; if absent, ask once.
+  if [ -z "${VPN_USER:-}" ]; then tty_read VPN_USER "Логин для клиентских скриптов: "; fi
+  if [ -z "${VPN_PASS:-}" ]; then tty_read VPN_PASS "Пароль для клиентских скриптов: "; fi
+  if [ -z "${PUBLIC_HOST:-}" ]; then tty_read PUBLIC_HOST "PUBLIC_HOST (IP/домен): "; fi
 
-  cat > /root/softether-clients/windows-sstp.ps1 <<EOF
-# Run in PowerShell (not CMD). No admin needed if using CurrentUser store.
+  rm -rf "$CLIENT_DIR"
+  mkdir -p "$CLIENT_DIR"
+
+  # Export server certificate to file for Windows trust import
+  run_vpncmd_server ServerCertGet "$CLIENT_DIR/server.cer" >/dev/null 2>&1 || {
+    echo "Не удалось выгрузить сертификат (ServerCertGet)."
+    exit 1
+  }
+
+  # Windows PowerShell script: imports cert, creates SSTP VPN, connects
+  cat >"$CLIENT_DIR/windows_sstp.ps1" <<EOF
+# Запускать PowerShell'ем от обычного пользователя.
+# Пароль внутри. Ты сам так захотел.
+
 \$VpnName = "SSTP-$PUBLIC_HOST"
 \$Server  = "$PUBLIC_HOST"
 \$User    = "$VPN_USER"
 \$Pass    = "$VPN_PASS"
 \$CertPath = Join-Path \$PSScriptRoot "server.cer"
 
-# Trust cert (self-signed). If you don't want this, use SoftEther VPN Client instead.
+# Импорт сертификата в доверенные (CurrentUser). Без админки.
 Import-Certificate -FilePath \$CertPath -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null
 
-# Create SSTP VPN profile
-Add-VpnConnection -Name \$VpnName -ServerAddress \$Server -TunnelType SSTP -AuthenticationMethod MSChapv2 -EncryptionLevel Optional -Force | Out-Null
+# Если подключение уже есть - удалим и создадим заново (идемпотентность)
+\$exists = Get-VpnConnection -Name \$VpnName -ErrorAction SilentlyContinue
+if (\$exists) {
+  Remove-VpnConnection -Name \$VpnName -Force
+}
 
-# Connect
+Add-VpnConnection -Name \$VpnName -ServerAddress \$Server -TunnelType SSTP \`
+  -AuthenticationMethod MSChapv2 -EncryptionLevel Optional -Force | Out-Null
+
 rasdial "\$VpnName" "\$User" "\$Pass"
 EOF
 
-  cat > /root/softether-clients/linux-sstp.sh <<'EOF'
+  # Linux script: installs sstp-client and connects (credentials inline)
+  cat >"$CLIENT_DIR/linux_sstp.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVER="${1:-}"
-USER="${2:-}"
-PASS="${3:-}"
+SERVER="$PUBLIC_HOST"
+USER="$VPN_USER"
+PASS="$VPN_PASS"
 
-if [ -z "$SERVER" ] || [ -z "$USER" ] || [ -z "$PASS" ]; then
-  echo "Usage: sudo ./linux-sstp.sh <server> <user> <pass>"
+# Требуется root
+if [ "\${EUID:-0}" -ne 0 ]; then
+  echo "Запусти: sudo \$0"
   exit 1
 fi
 
 apt-get update
 apt-get install -y sstp-client ppp
 
-# --cert-warn disables strict cert checks (matches your 'security doesn't matter' requirement). :contentReference[oaicite:6]{index=6}
-sstpc --cert-warn --user "$USER" --password "$PASS" "$SERVER" usepeerdns require-mschap-v2 refuse-eap noipdefault defaultroute
+# --cert-warn: отключаем строгую проверку сертификата (как ты и просил - быстро и просто)
+# defaultroute: весь трафик через VPN
+sstpc --cert-warn --user "\$USER" --password "\$PASS" "\$SERVER" \\
+  usepeerdns require-mschap-v2 refuse-eap noipdefault defaultroute
 EOF
-  chmod +x /root/softether-clients/linux-sstp.sh
+  chmod +x "$CLIENT_DIR/linux_sstp.sh"
 
-  cat > /root/softether-clients/README.txt <<EOF
-SERVER: $PUBLIC_HOST
-HUB:    $HUB_NAME
-USER:   $VPN_USER
-PASS:   $VPN_PASS
+  cat >"$CLIENT_DIR/README.txt" <<EOF
+SSTP server: $PUBLIC_HOST
+Hub:         ${HUB_NAME:-VPN}
+User:        $VPN_USER
+Password:    $VPN_PASS
 
 Windows:
-  - Copy folder to PC
-  - Run PowerShell: .\\windows-sstp.ps1
+  1) Скопируй папку softether-clients на ПК
+  2) Запусти PowerShell:
+     .\\windows_sstp.ps1
 
-Linux:
-  sudo ./linux-sstp.sh "$PUBLIC_HOST" "$VPN_USER" "$VPN_PASS"
+Linux (Debian/Ubuntu):
+  sudo ./linux_sstp.sh
 
 Android:
-  Use any SSTP client app:
-    Server: $PUBLIC_HOST
-    Username: $VPN_USER
-    Password: $VPN_PASS
-  If app asks about cert verification: disable verification or import server.cer.
+  Любой SSTP-клиент:
+   Server: $PUBLIC_HOST
+   User: $VPN_USER
+   Pass: $VPN_PASS
+  Если спросит про сертификат: отключи проверку или импортируй server.cer (если клиент умеет).
 EOF
 
-  (cd /root && zip -r softether-clients.zip softether-clients >/dev/null)
-  echo "Client bundle: /root/softether-clients.zip"
-  echo "Download it with: scp root@$PUBLIC_HOST:/root/softether-clients.zip ."
-}
-
-add_user() {
-  need_root
-  load_state
-  local u p
-  tty_read u "New username: "
-  tty_read p "Password for '$u': "
-  run_vpncmd_hub UserCreate "$u" /GROUP:none /REALNAME:none /NOTE:none >/dev/null 2>&1 || true
-  run_vpncmd_hub UserPasswordSet "$u" /PASSWORD:"$p" >/dev/null
-  echo "User added: $u"
-}
-
-del_user() {
-  need_root
-  load_state
-  local u
-  tty_read u "Username to delete: "
-  run_vpncmd_hub UserDelete "$u" >/dev/null
-  echo "User deleted: $u"
+  (cd /root && zip -r softether-clients.zip "$(basename "$CLIENT_DIR")" >/dev/null)
+  echo "Готово:"
+  echo "  Папка: $CLIENT_DIR"
+  echo "  Архив: /root/softether-clients.zip"
+  echo "Скачать:"
+  echo "  scp root@${PUBLIC_HOST}:/root/softether-clients.zip ."
 }
 
 uninstall_all() {
@@ -223,37 +277,27 @@ uninstall_all() {
   systemctl disable --now vpnserver 2>/dev/null || true
   rm -f "$UNIT"
   systemctl daemon-reload || true
-  rm -rf "$VPNROOT" "$SRCDIR" /root/softether-clients /root/softether-clients.zip
+  rm -rf "$VPNROOT" "$SRCDIR" "$CLIENT_DIR" /root/softether-clients.zip
   rm -f "$STATE"
-  echo "Removed SoftEther + configs."
+  echo "Всё удалено."
 }
 
 menu() {
-  load_state
   cat <<'EOF'
-1) Install SoftEther + configure SSTP + SecureNAT
-2) Add user
-3) Delete user
-4) Export client bundle (Windows/Linux/Android notes)
-5) Uninstall everything
+1) Установить + настроить + создать пользователя + сгенерировать клиентские скрипты
+2) Добавить пользователя
+3) Удалить пользователя
+4) Удалить весь сервис
 EOF
   local c
-  tty_read c "Select: "
+  tty_read c "Выбор: "
   case "$c" in
-    1) install_softether; initial_config; export_clients ;;
+    1) install_softether; initial_config ;;
     2) add_user ;;
     3) del_user ;;
-    4) export_clients ;;
-    5) uninstall_all ;;
-    *) echo "Nope." ;;
+    4) uninstall_all ;;
+    *) echo "Неверный выбор." ;;
   esac
 }
 
-case "${1:-menu}" in
-  install) install_softether; initial_config; export_clients ;;
-  add-user) add_user ;;
-  del-user) del_user ;;
-  export) export_clients ;;
-  uninstall) uninstall_all ;;
-  menu|*) menu ;;
-esac
+menu
